@@ -1,0 +1,130 @@
+import os
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, classification_report, confusion_matrix,
+    roc_auc_score, roc_curve
+)
+
+# CONFIG
+CSV_PATH = "helmet_features_auto.csv"
+MODEL_DIR = "models"
+MODEL_FILENAME = "yolov8.joblib"
+RANDOM_STATE = 42
+TRAIN_RATIO = 0.7
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
+
+LABEL_MAP = {"helmet": 1, "no_helmet": 0, 1: 1, 0: 0}
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+print("\n=== STEP 1: Load & Clean Data ===")
+df = pd.read_csv(CSV_PATH)
+df["label"] = df["label"].map(LABEL_MAP)
+df = df.dropna(subset=["label"])
+df["label"] = df["label"].astype(int)
+print("Label distribution:\n", df["label"].value_counts())
+
+# --- Train/Val/Test Split ---
+train_frac = TRAIN_RATIO
+val_frac = VAL_RATIO / (VAL_RATIO + TEST_RATIO)
+df_train, df_temp = train_test_split(df, test_size=(1-train_frac), stratify=df["label"], random_state=RANDOM_STATE)
+df_val, df_test = train_test_split(df_temp, test_size=1-val_frac, stratify=df_temp["label"], random_state=RANDOM_STATE)
+print(f"Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
+
+# --- Features and Labels ---
+feat_cols = [c for c in df_train.columns if c not in ("label", "image_name")]
+X_train = df_train[feat_cols].values
+y_train = df_train["label"].values.astype(int)
+X_val   = df_val[feat_cols].values
+y_val   = df_val["label"].values.astype(int)
+X_test  = df_test[feat_cols].values
+y_test  = df_test["label"].values.astype(int)
+print("Features: train", X_train.shape, "val", X_val.shape, "test", X_test.shape)
+
+# --- Model Training ---
+print("\nSTEP 2: Train Models + Validate")
+candidates = {}
+
+print("Training Logistic Regression ...")
+lr = LogisticRegression(max_iter=2000, class_weight="balanced", random_state=RANDOM_STATE)
+lr.fit(X_train, y_train)
+yv_prob = lr.predict_proba(X_val)[:, 1]
+auc_lr = roc_auc_score(y_val, yv_prob)
+candidates["logreg"] = (lr, auc_lr)
+print("LogisticRegression Val ROC AUC:", auc_lr)
+
+print("Training Random Forest ...")
+rf = RandomForestClassifier(n_estimators=200, class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1)
+rf.fit(X_train, y_train)
+yv_prob = rf.predict_proba(X_val)[:, 1]
+auc_rf = roc_auc_score(y_val, yv_prob)
+candidates["rf"] = (rf, auc_rf)
+print("RandomForest Val ROC AUC:", auc_rf)
+
+# Best model select
+best_name, best_model, best_auc = None, None, -1
+for name, (mdl, auc) in candidates.items():
+    if auc > best_auc:
+        best_name, best_model, best_auc = name, mdl, auc
+print(f"BEST MODEL: {best_name} | Val ROC AUC: {best_auc:.4f}")
+
+# --- Test and METRICS ---
+print("\nSTEP 3: TEST + PLOTS")
+y_pred = best_model.predict(X_test)
+y_prob = best_model.predict_proba(X_test)[:, 1]
+
+acc = accuracy_score(y_test, y_pred)
+report = classification_report(y_test, y_pred, digits=4)
+cm = confusion_matrix(y_test, y_pred)
+auc_test = roc_auc_score(y_test, y_prob)
+
+print("Test Accuracy:", acc)
+print("Test ROC AUC:", auc_test)
+print("Classification Report:\n", report)
+print("Confusion Matrix:\n", cm)
+
+# --- Save best model ---
+save_path = os.path.join(MODEL_DIR, MODEL_FILENAME)
+joblib.dump(best_model, save_path)
+print("Model saved at:", save_path)
+
+# --- Confusion Matrix Plot (Show + Save) ---
+plt.figure(figsize=(5,4))
+plt.imshow(cm, cmap=plt.cm.Blues)
+plt.title("Confusion Matrix (Test)")
+plt.colorbar()
+plt.xticks([0,1], ["no_helmet", "helmet"], rotation=45)
+plt.yticks([0,1], ["no_helmet", "helmet"])
+thresh = cm.max() / 2.
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        plt.text(j, i, str(cm[i, j]),
+                 ha="center", va="center",
+                 color="white" if cm[i, j] > thresh else "black")
+plt.xlabel("Predicted label")
+plt.ylabel("True label")
+plt.tight_layout()
+plt.savefig(os.path.join(MODEL_DIR, "confusion_matrix_test.png"))
+plt.show()
+
+# --- ROC Curve Plot (Show + Save) ---
+fpr, tpr, _ = roc_curve(y_test, y_prob)
+plt.figure(figsize=(6,5))
+plt.plot(fpr, tpr, color='blue', label=f"ROC AUC = {auc_test:.4f}")
+plt.plot([0, 1], [0, 1], '--', color='gray', linewidth=1)
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve (Test)")
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(MODEL_DIR, "roc_test.png"))
+plt.show()
+
+print("\nSaved confusion matrix, ROC curve at:", MODEL_DIR)
+print("Done! 🚀")

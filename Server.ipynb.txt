@@ -1,0 +1,87 @@
+from flask import Flask, request, jsonify
+import os, traceback, time
+import numpy as np
+import cv2
+import torch
+
+# ======================
+# FIXED MODEL PATH (YOUR PATH)
+# ======================
+ROOT = r"C:\Users\Public.DESKTOP-5OD2S60\Downloads\Helmet"
+MODEL_PATH = os.path.join(ROOT, "mobile_model.pt")   # OR mobile_model_quant.pt
+IMG_SIZE = 640
+THRESH_DEFAULT = 0.5
+
+app = Flask(__name__)
+device = torch.device("cpu")
+
+print("=====================================")
+print("Loading model from:")
+print(">>>", MODEL_PATH)
+print("=====================================")
+
+# Load model
+model = torch.jit.load(MODEL_PATH, map_location=device)
+model.eval()
+print("Model loaded successfully!")
+
+# -------------------------------
+# Image decode helper
+# -------------------------------
+def decode_image(img_bytes):
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError("Failed to decode image")
+
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
+
+    tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
+    return tensor
+
+# -------------------------------
+# Prediction API
+# -------------------------------
+@app.route("/predict", methods=["POST"])
+def predict():
+    try:
+        start = time.time()
+
+        if "image" in request.files:
+            img_bytes = request.files["image"].read()
+        else:
+            img_bytes = request.data
+
+        if not img_bytes:
+            return jsonify({"error": "No image received"}), 400
+
+        inp = decode_image(img_bytes)
+
+        with torch.no_grad():
+            out = model(inp)
+
+        if isinstance(out, torch.Tensor):
+            prob = float(out.cpu().numpy().item())
+        else:
+            prob = float(out)
+
+        label = "helmet" if prob >= THRESH_DEFAULT else "no_helmet"
+        elapsed = time.time() - start
+
+        return jsonify({
+            "label": label,
+            "prob": prob,
+            "time": elapsed
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)

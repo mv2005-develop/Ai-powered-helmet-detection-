@@ -1,0 +1,431 @@
+import os
+import time
+import cv2
+import torch
+import numpy as np
+import winsound
+
+ROOT = r"C:\Users\Public.DESKTOP-5OD2S60\Downloads\Helmet"
+CLASSIFIER_PATH = os.path.join(ROOT, "mobile_model.pt")
+AUDIO_OK = os.path.join(ROOT, "helmet_ok.wav")
+AUDIO_NO = os.path.join(ROOT, "no_helmet.wav")
+CAM_INDEX = 0
+THRESH = 0.25
+CHECK_INTERVAL = 60
+CONSECUTIVE_HELMET = 1  # Changed to 1 for immediate success sound
+CENTER_RADIUS = 300  # Radius of center circle in pixels
+
+def play_sound(path):
+    try:
+        if os.path.exists(path):
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+    except Exception as e:
+        print(f"Sound error: {e}")
+
+def load_classifier(path):
+    print("[INFO] Loading helmet classifier:", path)
+    model = torch.jit.load(path, map_location="cpu")
+    model.eval()
+    return model
+
+def preprocess_img_for_classifier(img_bgr, size=640):
+    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (size, size)).astype(np.float32) / 255.0
+    return img
+
+def classifier_predict_prob(classifier, roi_bgr):
+    if roi_bgr is None or roi_bgr.size == 0:
+        return 0.0
+    pre = preprocess_img_for_classifier(roi_bgr)
+    t = torch.from_numpy(pre).permute(2, 0, 1).unsqueeze(0)
+    with torch.no_grad():
+        out = classifier(t)
+    if isinstance(out, torch.Tensor):
+        arr = out.cpu().numpy().ravel()
+        raw = float(arr[0])
+    else:
+        raw = float(out)
+    if 0.0 <= raw <= 1.0:
+        prob = raw
+    else:
+        prob = 1.0 / (1.0 + np.exp(-raw))
+    return float(prob)
+
+def is_inside_circle(box, center_x, center_y, radius):
+    """
+    Check if the center of the bounding box is inside the circle
+    """
+    x, y, w, h = box[:4]
+    box_center_x = x + w // 2
+    box_center_y = y + h // 2
+    
+    distance = np.sqrt((box_center_x - center_x)**2 + (box_center_y - center_y)**2)
+    return distance <= radius, distance
+
+def detect_humans_in_center_only(image, center_x, center_y, radius):
+    """
+    Detect humans but ONLY return those INSIDE the center circle
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    img_height, img_width = image.shape[:2]
+    all_detections = []
+    
+    # Upper body detection
+    body_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_upperbody.xml")
+    bodies = body_cascade.detectMultiScale(
+        gray, 
+        scaleFactor=1.05,
+        minNeighbors=2,
+        minSize=(80, 120),
+        maxSize=(img_width, img_height)
+    )
+    
+    for (x, y, w, h) in bodies:
+        is_in_circle, dist = is_inside_circle([x, y, w, h], center_x, center_y, radius)
+        if is_in_circle:  # ONLY add if inside circle!
+            all_detections.append([x, y, w, h, "upper_body", dist])
+    
+    # Full body detection as backup
+    fullbody_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_fullbody.xml")
+    fullbodies = fullbody_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=2,
+        minSize=(60, 100)
+    )
+    
+    for (x, y, w, h) in fullbodies:
+        h_upper = int(h * 0.5)
+        is_in_circle, dist = is_inside_circle([x, y, w, h_upper], center_x, center_y, radius)
+        
+        if is_in_circle:  # ONLY add if inside circle!
+            # Check for overlap with existing detections
+            is_duplicate = False
+            for det in all_detections:
+                if abs(x - det[0]) < 50 and abs(y - det[1]) < 50:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                all_detections.append([x, y, w, h_upper, "full_body", dist])
+    
+    # If no detection in circle, try center region ROI directly
+    if len(all_detections) == 0:
+        # Create a box in the center
+        roi_size = int(radius * 1.5)
+        x1 = max(0, center_x - roi_size // 2)
+        y1 = max(0, center_y - roi_size // 2)
+        x2 = min(img_width, center_x + roi_size // 2)
+        y2 = min(img_height, center_y + roi_size // 2)
+        w = x2 - x1
+        h = y2 - y1
+        
+        if w > 100 and h > 150:
+            all_detections.append([x1, y1, w, h, "center_roi", 0.0])
+    
+    return all_detections
+
+def create_helmet_roi(body_box):
+    """Create ROI for helmet detection"""
+    x, y, w, h = body_box[:4]
+    
+    # Take upper 50% (head + shoulders)
+    roi_height = int(h * 0.5)
+    y_top = max(0, y - int(h * 0.1))
+    y_bottom = y + roi_height
+    
+    margin = int(w * 0.1)
+    x_left = max(0, x - margin)
+    x_right = x + w + margin
+    
+    return [x_left, y_top, x_right, y_bottom]
+
+def select_best_in_circle(detections_in_circle, frame, classifier):
+    """
+    Select best person among those in circle:
+    Priority: Helmet wearer > Closest to center
+    """
+    if len(detections_in_circle) == 0:
+        return None, None, 0.0, "none"
+    
+    candidates = []
+    
+    for detection in detections_in_circle:
+        x, y, w, h, method, dist = detection
+        
+        # Create helmet ROI
+        roi_box = create_helmet_roi(detection)
+        roi = frame[roi_box[1]:roi_box[3], roi_box[0]:roi_box[2]]
+        
+        if roi.size == 0 or roi.shape[0] < 20 or roi.shape[1] < 20:
+            helmet_prob = 0.0
+        else:
+            helmet_prob = classifier_predict_prob(classifier, roi)
+        
+        candidates.append({
+            'detection': detection,
+            'roi_box': roi_box,
+            'helmet_prob': helmet_prob,
+            'center_dist': dist,
+            'method': method
+        })
+    
+    # Sort: helmet probability first (descending), then distance (ascending)
+    candidates.sort(key=lambda c: (-c['helmet_prob'], c['center_dist']))
+    
+    best = candidates[0]
+    
+    if best['helmet_prob'] >= THRESH:
+        reason = f"IN_CIRCLE+HELMET(prob:{best['helmet_prob']:.2f})"
+    else:
+        reason = f"IN_CIRCLE_NO_HELMET(dist:{int(best['center_dist'])}px)"
+    
+    return best['detection'], best['roi_box'], best['helmet_prob'], reason
+
+def main():
+    print("=" * 70)
+    print("HELMET MONITOR - STRICT CENTER CIRCLE FOCUS")
+    print("=" * 70)
+    print("Rules:")
+    print(f"  1. ONLY detect people INSIDE center circle ({CENTER_RADIUS}px radius)")
+    print("  2. IGNORE everyone outside the circle completely")
+    print("  3. If multiple people in circle → prioritize HELMET WEARER")
+    print("  4. If no helmet → select closest to center")
+    print(f"Helmet Threshold: {THRESH}")
+    print("=" * 70)
+    
+    classifier = load_classifier(CLASSIFIER_PATH)
+    cap = cv2.VideoCapture(CAM_INDEX)
+    
+    # Camera settings
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    
+    helmet_streak = 0
+    ok_sound_played = False
+    last_check_time = 0
+    first_time = True
+    
+    print("\n[INFO] Camera initialized.")
+    print("[INFO] Stand INSIDE the YELLOW CIRCLE for detection")
+    print("[INFO] Anyone outside the circle will be IGNORED")
+    print("[INFO] Press 's' for instant check, 'q' to quit\n")
+
+    while True:
+        try:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print("Camera frame not available, retrying...")
+                time.sleep(0.5)
+                continue
+
+            img_height, img_width = frame.shape[:2]
+            frame_center_x = img_width // 2
+            frame_center_y = img_height // 2
+
+            # CRITICAL: Only detect people INSIDE the center circle
+            detections_in_circle = detect_humans_in_center_only(
+                frame, frame_center_x, frame_center_y, CENTER_RADIUS
+            )
+            
+            # Select best person from those in circle
+            selected_body, selected_roi, helmet_prob, selection_reason = select_best_in_circle(
+                detections_in_circle, frame, classifier
+            )
+            
+            # Visualization
+            preview = frame.copy()
+            
+            # Draw CENTER CIRCLE (THICK - this is the detection zone!)
+            cv2.circle(preview, (frame_center_x, frame_center_y), CENTER_RADIUS, (0, 255, 255), 3)
+            cv2.circle(preview, (frame_center_x, frame_center_y), 5, (0, 255, 255), -1)
+            
+            # Add text on circle
+            cv2.putText(preview, "DETECTION ZONE", 
+                       (frame_center_x - 80, frame_center_y - CENTER_RADIUS - 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(preview, "Stand INSIDE this circle", 
+                       (frame_center_x - 110, frame_center_y + CENTER_RADIUS + 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            # Draw ALL detections in circle (light blue)
+            for detection in detections_in_circle:
+                x, y, w, h = detection[:4]
+                cv2.rectangle(preview, (x, y), (x + w, y + h), (255, 200, 100), 1)
+                
+                # Mark center
+                det_center_x = x + w // 2
+                det_center_y = y + h // 2
+                cv2.circle(preview, (det_center_x, det_center_y), 3, (255, 200, 100), -1)
+            
+            # Draw SELECTED person prominently
+            if selected_body is not None and selected_roi is not None:
+                x, y, w, h = selected_body[:4]
+                
+                # Body box in RED (thick)
+                cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 0, 255), 4)
+                
+                # Helmet ROI in GREEN (thick)
+                cv2.rectangle(preview,
+                            (selected_roi[0], selected_roi[1]),
+                            (selected_roi[2], selected_roi[3]),
+                            (0, 255, 0), 4)
+                
+                # Mark selected person's center
+                sel_center_x = x + w // 2
+                sel_center_y = y + h // 2
+                cv2.circle(preview, (sel_center_x, sel_center_y), 8, (0, 0, 255), -1)
+                
+                # Draw line from circle center to person center
+                cv2.line(preview, (frame_center_x, frame_center_y), 
+                        (sel_center_x, sel_center_y), (255, 0, 255), 2)
+                
+                # Status text
+                status_color = (0, 255, 0) if helmet_prob >= THRESH else (0, 165, 255)
+                status_text = f"SELECTED: {selection_reason}"
+                cv2.putText(preview, status_text, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+                
+                prob_text = f"Helmet Prob: {helmet_prob:.3f} | Threshold: {THRESH}"
+                cv2.putText(preview, prob_text, (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+                
+                # Detection count
+                count_text = f"In Circle: {len(detections_in_circle)} person(s)"
+                cv2.putText(preview, count_text, (10, 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            else:
+                cv2.putText(preview, "NO PERSON IN CIRCLE - Stand INSIDE yellow circle", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            # Instructions
+            cv2.putText(preview, "Cyan Circle=Detection Zone | Red=Selected | Green=Helmet Check", 
+                       (10, preview.shape[0] - 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(preview, "Press 's'=Check Now | 'q'=Quit", 
+                       (10, preview.shape[0] - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            cv2.imshow("Helmet Monitor [STRICT CIRCLE FOCUS]", preview)
+
+            # Check timing
+            current_time = time.time()
+            key = cv2.waitKey(10) & 0xFF
+            force_check = (key == ord('s'))
+            
+            if first_time or force_check or (current_time - last_check_time >= CHECK_INTERVAL):
+                first_time = False
+                
+                if selected_roi is not None:
+                    # Extract ROI
+                    roi = frame[selected_roi[1]:selected_roi[3], selected_roi[0]:selected_roi[2]]
+                    
+                    if roi.size == 0 or roi.shape[0] < 20 or roi.shape[1] < 20:
+                        print("[WARNING] Invalid ROI, skipping...")
+                        prob = 0.0
+                        status = "no_helmet"
+                    else:
+                        # Check helmet
+                        prob = classifier_predict_prob(classifier, roi)
+                        status = "helmet" if prob >= THRESH else "no_helmet"
+                        
+                        # Save debug image
+                        timestamp_str = time.strftime('%H%M%S')
+                        debug_path = os.path.join(ROOT, f"check_{timestamp_str}_{status}_p{int(prob*100)}.jpg")
+                        cv2.imwrite(debug_path, roi)
+                else:
+                    prob = 0.0
+                    status = "no_helmet"
+                
+                # Print result
+                timestamp = time.strftime('%H:%M:%S')
+                print(f"\n{'='*70}")
+                print(f"[{timestamp}] CHECK RESULT:")
+                print(f"  People IN CIRCLE: {len(detections_in_circle)}")
+                if selected_body:
+                    print(f"  Selected: {selection_reason}")
+                    print(f"  Method: {selected_body[4]}")
+                else:
+                    print(f"  Selected: NONE - No one in detection circle")
+                print(f"  Helmet Status: {status.upper()}")
+                print(f"  Confidence: {prob:.3f} (threshold: {THRESH})")
+                
+                # Audio feedback
+                if status == "no_helmet":
+                    play_sound(AUDIO_NO)
+                    ok_sound_played = False
+                    helmet_streak = 0
+                    print(f"  Result: ❌ NO HELMET")
+                else:
+                    helmet_streak += 1
+                    print(f"  Result: ✓ Helmet detected")
+                    if helmet_streak >= CONSECUTIVE_HELMET and not ok_sound_played:
+                        play_sound(AUDIO_OK)
+                        print(f"\n{'*'*70}")
+                        print(f"*** ✓✓✓ SUCCESS: HELMET VERIFIED IN CIRCLE ✓✓✓ ***")
+                        print(f"*** Confidence: {prob:.3f} ***")
+                        print(f"{'*'*70}\n")
+                        ok_sound_played = True
+                
+                print(f"{'='*70}\n")
+                last_check_time = current_time
+
+            if key == ord('q'):
+                print("\n[INFO] Exiting...")
+                break
+                
+        except Exception as e:
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print("\n[INFO] Helmet Monitor stopped.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+======================================================================
+[14:50:59] CHECK RESULT:
+  People IN CIRCLE: 1
+  Selected: IN_CIRCLE+HELMET(prob:0.92)
+  Method: center_roi
+  Helmet Status: HELMET
+  Confidence: 0.922 (threshold: 0.25)
+  Result: ✓ Helmet detected
+
+**********************************************************************
+*** ✓✓✓ SUCCESS: HELMET VERIFIED IN CIRCLE ✓✓✓ ***
+*** Confidence: 0.922 ***
+
+
+
+
+
+
+
+
+
+
+
+
+======================================================================
+[14:53:21] CHECK RESULT:
+  People IN CIRCLE: 1
+  Selected: IN_CIRCLE_NO_HELMET(dist:76px)
+  Method: upper_body
+  Helmet Status: NO_HELMET
+  Confidence: 0.018 (threshold: 0.25)
+  Result: ❌ NO HELMET
+======================================================================

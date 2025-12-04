@@ -1,0 +1,89 @@
+import os, joblib, numpy as np, torch, cv2, traceback
+from ultralytics import YOLO
+import torch.nn as nn
+
+ROOT = r"C:\Users\Public.DESKTOP-5OD2S60\Downloads\Helmet"
+YOLO_WEIGHTS = os.path.join(ROOT, "yolov8s.pt")
+SCALER_PATH = os.path.join(ROOT, "preprocessed", "scaler.joblib")
+PCA_PATH = os.path.join(ROOT, "preprocessed", "pca.joblib")
+CLASSIFIER_PATH = os.path.join(ROOT, "models", "yolov8.joblib")
+
+OUT_PATH = os.path.join(ROOT, "mobile_model.pt")
+IMG_SIZE = 640
+MIN_CHANNELS = 32
+
+print("Loading YOLO backbone...")
+yolo = YOLO(YOLO_WEIGHTS)
+model = yolo.model
+model.eval()
+
+print("Loading scaler, PCA, classifier...")
+scaler = joblib.load(SCALER_PATH)
+pca = joblib.load(PCA_PATH)
+clf = joblib.load(CLASSIFIER_PATH)
+
+# Identify good conv layer
+conv_layers = [(n,m) for n,m in model.named_modules() if isinstance(m,nn.Conv2d)]
+chosen = None
+for name,m in reversed(conv_layers):
+    if m.out_channels >= MIN_CHANNELS:
+        chosen = (name,m)
+        break
+if chosen is None:
+    chosen = conv_layers[-1]
+layer_name, target_layer = chosen
+
+print("Using layer:", layer_name)
+
+# Convert sklearn LogisticRegression → torch weights
+coef = np.asarray(clf.coef_)[0]
+inter = np.asarray(clf.intercept_)[0]
+W = torch.tensor(coef, dtype=torch.float32)
+B = torch.tensor([inter], dtype=torch.float32)
+
+class MobileModel(torch.nn.Module):
+    def __init__(self, yolo, layer_name, scaler, pca, W, B):
+        super().__init__()
+        self.yolo = yolo
+        self.layer_name = layer_name
+        self.scaler_mean = torch.tensor(scaler.mean_, dtype=torch.float32)
+        self.scaler_scale = torch.tensor(scaler.scale_, dtype=torch.float32)
+        self.pca_comp = torch.tensor(pca.components_, dtype=torch.float32)
+        self.pca_mean = torch.tensor(pca.mean_, dtype=torch.float32)
+        self.W = W.view(1,-1)
+        self.B = B
+
+        # Resolve layer
+        for n,m in self.yolo.named_modules():
+            if n == layer_name:
+                self.layer = m
+                break
+
+    def forward(self, x):
+        feats = []
+        def hook(m,i,o): feats.append(o)
+        h = self.layer.register_forward_hook(hook)
+        _ = self.yolo(x)
+        h.remove()
+
+        fm = feats[0]  # [1,C,H,W]
+        v = fm.mean(dim=[2,3])  # GAP
+
+        v = (v - self.scaler_mean) / self.scaler_scale
+        v = (v - self.pca_mean) @ self.pca_comp.T
+
+        logits = v @ self.W.T + self.B
+        prob = torch.sigmoid(logits).squeeze(1)
+        return prob
+
+print("Building mobile model...")
+m = MobileModel(model, layer_name, scaler, pca, W, B)
+m.eval()
+
+dummy = torch.zeros([1,3,IMG_SIZE,IMG_SIZE], dtype=torch.float32)
+
+print("Exporting TorchScript model...")
+traced = torch.jit.trace(m, dummy, strict=False)
+torch.jit.save(traced, OUT_PATH)
+
+print("Saved to:", OUT_PATH)

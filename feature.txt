@@ -1,0 +1,120 @@
+import os, cv2, torch, pandas as pd, traceback
+from ultralytics import YOLO
+import torch.nn as nn
+from tqdm import tqdm
+
+# ---------------- CONFIG ----------------
+MODEL_PATH = "yolov8s.pt"
+DATASET_DIR = r"C:\Users\Public.DESKTOP-5OD2S60\Downloads\Helmet\HelmetGuard_Raw"
+OUTPUT_CSV = "helmet_features_auto.csv"
+IMG_SIZE = 640
+MIN_CHANNELS = 32
+BATCH_FLUSH = 50
+LABEL_MAP = {"helmet": 1, "no_helmet": 0}
+CLASSES = ["helmet", "no_helmet"]
+# ----------------------------------------
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# Load YOLO and layer selection
+model = YOLO(MODEL_PATH)
+model.model.to(device)
+model.model.eval()
+conv_layers = [(name, m, m.out_channels) for name, m in model.model.named_modules() if isinstance(m, nn.Conv2d)]
+chosen = None
+for name, m, c in reversed(conv_layers):
+    if c >= MIN_CHANNELS:
+        chosen = (name, m, c); break
+if chosen is None and conv_layers:
+    chosen = max(conv_layers, key=lambda x: x[2])
+if chosen is None:
+    raise RuntimeError("No Conv2d layers found in model.")
+layer_name, target_layer, ch = chosen
+print("Chosen layer:", layer_name, "| channels:", ch)
+
+def extract_features_single(img_path):
+    try:
+        img = cv2.imread(img_path)
+        if img is None: return None
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+        tensor = torch.tensor(img, dtype=torch.float32, device=device).permute(2,0,1).unsqueeze(0) / 255.0
+        feats = []
+        def hook(module, inp, out): feats.append(out.detach())
+        handle = target_layer.register_forward_hook(hook)
+        with torch.no_grad():
+            try: _ = model.model(tensor)
+            except Exception: _ = model(tensor)
+        handle.remove()
+        if not feats: return None
+        fm = feats[0]
+        if fm.ndim != 4: return None
+        vec = fm.mean(dim=[2,3]).squeeze(0).cpu().flatten().tolist()
+        return vec
+    except Exception:
+        print("Feature extract error:", img_path)
+        traceback.print_exc()
+        return None
+
+# Determine expected_dim from sample
+sample_img = None
+for cls in CLASSES:
+    folder = os.path.join(DATASET_DIR, cls)
+    if os.path.exists(folder):
+        samples = [f for f in os.listdir(folder) if f.lower().endswith((".jpg",".jpeg",".png"))]
+        if samples:
+            sample_img = os.path.join(folder, samples[0])
+            break
+if sample_img is None: raise Exception("No sample image found for dim check.")
+sample_vec = extract_features_single(sample_img)
+if sample_vec is None: raise Exception("Sample extraction error.")
+expected_dim = len(sample_vec)
+columns = [f"f{i}" for i in range(expected_dim)] + ["label", "image_name"]
+
+# Count total images
+count = 0
+for cls in CLASSES:
+    folder = os.path.join(DATASET_DIR, cls)
+    if os.path.exists(folder):
+        count += len([f for f in os.listdir(folder) if f.lower().endswith((".jpg",".jpeg",".png"))])
+
+print(f"Total images to process: {count}")
+pbar = tqdm(total=count)
+
+rows = []
+for cls in CLASSES:
+    folder = os.path.join(DATASET_DIR, cls)
+    if not os.path.exists(folder): continue
+    files = sorted([f for f in os.listdir(folder) if f.lower().endswith((".jpg",".jpeg",".png"))])
+    for fname in files:
+        img_path = os.path.join(folder, fname)
+        vec = extract_features_single(img_path)
+        if vec is None:
+            pbar.update(1); continue
+        if len(vec) < expected_dim:
+            vec += [0.0] * (expected_dim - len(vec))
+        elif len(vec) > expected_dim:
+            vec = vec[:expected_dim]
+        row = {f"f{i}": float(v) for i, v in enumerate(vec)}
+        row["label"] = LABEL_MAP[cls]
+        row["image_name"] = fname
+        rows.append(row)
+        # batch flush
+        if len(rows) >= BATCH_FLUSH:
+            df_chunk = pd.DataFrame(rows, columns=columns)
+            header = not os.path.exists(OUTPUT_CSV)
+            df_chunk.to_csv(OUTPUT_CSV, mode="a", header=header, index=False)
+            rows = []
+        pbar.update(1)
+
+pbar.close()
+
+# Final flush
+if rows:
+    df_chunk = pd.DataFrame(rows, columns=columns)
+    header = not os.path.exists(OUTPUT_CSV)
+    df_chunk.to_csv(OUTPUT_CSV, mode="a", header=header, index=False)
+
+print("✅ All done — saved to", OUTPUT_CSV)
+print("Feature dim:", expected_dim, "| Chosen layer:", layer_name, "| channels:", ch)
